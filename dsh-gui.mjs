@@ -260,23 +260,21 @@ async function openAppWindow(url) {
   console.log(`dsh gui: app window opened (${browser})`)
   // Best-effort: repaint the window's icon to the whale. Edge ignores the
   // AppUserModelID->shortcut icon association for --app windows, so patch the
-  // window directly (WM_SETICON + class icon, cross-process) a few times
-  // while the window shows up. The profile-dir marker lets the script find
-  // whichever Edge process actually owns the window. Silent no-op on failure.
+  // window class icon directly (cross-process SetClassLongPtr) a few times
+  // while the window shows up. Silent no-op when anything fails.
   if (process.platform === 'win32') {
     const patchIcon = () => spawn(
       'powershell',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
         join(ROOT, 'dsh-gui-taskbar-icon.ps1'),
-        '-ProcessId', String(child.pid), '-IconPath', join(ROOT, 'dsh-gui.ico'),
-        '-ProfileDir', profileDir],
+        '-ProcessId', String(child.pid), '-IconPath', join(ROOT, 'dsh-gui.ico')],
       { stdio: 'ignore', windowsHide: true },
     )
     let attempts = 0
     const timer = setInterval(() => {
-      if (++attempts > 12) { clearInterval(timer); return }
+      if (++attempts > 8) { clearInterval(timer); return }
       patchIcon()
-    }, 1500)
+    }, 2000)
     child.on('exit', () => clearInterval(timer))
   }
   await new Promise((resolve) => {
