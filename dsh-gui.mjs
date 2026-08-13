@@ -31,6 +31,11 @@ const APP_USER_MODEL_ID = 'DeepSeekHarnessGUI'
 // Sentinel: a live lock holder claims a server but it is unreachable; the
 // gateway must not start a second writer.
 const REFUSED = Symbol('dsh-gui-refused')
+// How long detectRunningHarness waits for a live-but-unreachable lock holder
+// to finish winding down (usually a just-closed window's server) before
+// refusing, and how often it re-checks.
+const RETRY_HOLDER_MS = 8000
+const RETRY_HOLDER_STEP_MS = 400
 
 // The single-writer lock mirrors apps/cli/src/web-lock.ts (replicated here so
 // this standalone launcher stays dependency-free). Two servers appending the
@@ -106,9 +111,14 @@ async function probeHarnessOn(port) {
  * probe: opens no session and writes nothing to the session store.
  */
 async function detectRunningHarness() {
-  if (await probeHarnessOn(DEFAULT_WEB_PORT)) return `http://127.0.0.1:${DEFAULT_WEB_PORT}`
-  const holder = readWebLock()
-  if (holder !== undefined && pidAlive(holder.pid)) {
+  // A live but unreachable holder is usually a just-closed window's server
+  // still winding down (graceful stop can take a few seconds before the lock
+  // is released). Wait for it instead of failing the click immediately.
+  const start = Date.now()
+  while (true) {
+    if (await probeHarnessOn(DEFAULT_WEB_PORT)) return `http://127.0.0.1:${DEFAULT_WEB_PORT}`
+    const holder = readWebLock()
+    if (holder === undefined || !pidAlive(holder.pid)) return undefined
     const candidate = holder.url ?? (holder.port !== undefined && holder.port > 0
       ? `http://127.0.0.1:${String(holder.port)}`
       : undefined)
@@ -116,13 +126,14 @@ async function detectRunningHarness() {
       const port = Number(new URL(candidate).port)
       if (port > 0 && (await probeHarnessOn(port))) return candidate
     }
-    // A live claim that cannot be reached: starting a second server would
-    // create the dual-writer hazard the lock exists to prevent.
-    console.error(`dsh gui: another server is claimed running (pid ${String(holder.pid)}) but unreachable`)
-    console.error('dsh gui: stop that process first, or force a second server with --parallel')
-    return REFUSED
+    if (Date.now() - start >= RETRY_HOLDER_MS) break
+    await new Promise((resolve) => setTimeout(resolve, RETRY_HOLDER_STEP_MS))
   }
-  return undefined
+  // Starting a second server while a live claim exists would create the
+  // dual-writer hazard the lock exists to prevent.
+  console.error(`dsh gui: another server is claimed running (pid ${String(readWebLock()?.pid ?? '?')}) but unreachable`)
+  console.error('dsh gui: run dsh-gui --stop to end a leftover server, or force a second one with --parallel')
+  return REFUSED
 }
 
 /** Parse the launcher's own flags; everything after `--` forwards to the web profile. */
@@ -174,11 +185,17 @@ function readPid() {
   }
 }
 
-/** Kill a leftover server started by a previous gateway run. */
+/** Kill a leftover server started by a previous gateway run (PID file or lock). */
 function stopServer() {
-  const pid = readPid()
+  let pid = readPid()
   if (pid === undefined) {
-    console.log('dsh gui: no running server (no PID file)')
+    // The PID file may be gone (e.g. a crash, or a server started outside the
+    // gateway); the single-writer lock still names the live server.
+    const holder = readWebLock()
+    if (holder !== undefined && pidAlive(holder.pid)) pid = holder.pid
+  }
+  if (pid === undefined) {
+    console.log('dsh gui: no running server (no PID file, no lock holder)')
     return
   }
   if (process.platform === 'win32') {
@@ -188,7 +205,13 @@ function stopServer() {
     try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
     console.log(`dsh gui: stopped server pid ${pid}`)
   }
-  unlinkSync(PID_PATH)
+  try { unlinkSync(PID_PATH) } catch { /* already gone */ }
+  // A hard-killed server could not release its lock; clear the stale claim.
+  // Only when the lock still names the process we just stopped.
+  try {
+    const record = readWebLock()
+    if (record !== undefined && record.pid === pid) rmSync(webLockPath(), { force: true })
+  } catch { /* best effort */ }
 }
 
 /**
