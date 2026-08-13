@@ -258,7 +258,14 @@ async function openAppWindow(url) {
 
 /** Spawn the harness web server, tee its output, and wait for the readiness line. */
 function spawnServer(port, forwarded, audit, force) {
-  const args = ['--import', 'tsx/esm', join(ROOT, 'apps/cli/src/bin.ts'), '--profile', 'web', '--port', port, ...forwarded]
+  // Prefer the compiled CLI: cold boot drops from ~22s (tsx transpiling TS on
+  // the fly) to ~1-2s. Fall back to the TS source via tsx when a fresh copy
+  // has no build yet.
+  const compiled = join(ROOT, 'apps/cli/lib/bin.js')
+  const bin = existsSync(compiled) ? compiled : join(ROOT, 'apps/cli/src/bin.ts')
+  const args = bin.endsWith('.ts')
+    ? ['--import', 'tsx/esm', bin, '--profile', 'web', '--port', port, ...forwarded]
+    : [bin, '--profile', 'web', '--port', port, ...forwarded]
   const env = force === true ? { ...process.env, DSH_GUI_FORCE_WEB: '1' } : process.env
   const child = spawn(process.execPath, args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env })
   writePid(child.pid)

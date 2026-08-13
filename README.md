@@ -8,7 +8,7 @@
 
 ## 快速开始
 
-**双击桌面图标「DeepSeek Harness GUI」**（推荐，无控制台窗口；图标为 DeepSeek 官方鲸鱼 Logo，取自仓库自带 favicon）；服务器会在后台静默启动，等 30–90 秒后弹出应用窗口，**关闭窗口即停止全部服务**。
+**双击桌面图标「DeepSeek Harness GUI」**（推荐，无控制台窗口；图标为 DeepSeek 官方鲸鱼 Logo，取自仓库自带 favicon）；服务器直接运行**预编译产物**（`apps/cli/lib/bin.js`），冷启动约 1~2 秒就绪（首次可能稍久），随后立即弹出应用窗口，**关闭窗口即停止全部服务**。
 
 如果没有该图标（比如换了电脑），先运行一次 `dsh-gui.cmd --make-shortcut` 生成；也可以：
 
@@ -31,7 +31,7 @@
 ## 工作原理
 
 - 桌面图标「DeepSeek Harness GUI」（`.lnk` → `wscript dsh-gui.vbs`）以**隐藏控制台**方式运行同一个网关：`dsh-gui.vbs` 先检查 node 是否存在，再静默启动；`dsh-gui.cmd --make-shortcut` 负责生成该图标。
-- `dsh-gui.mjs` 是一个 Node 脚本（唯一的运行时依赖是已安装的 Node.js，**启动过程不调用 npm**）。它以 `node --import tsx/esm apps/cli/src/bin.ts --profile web --port <port>` 派生启动 web profile 服务。
+- `dsh-gui.mjs` 是一个 Node 脚本（唯一的运行时依赖是已安装的 Node.js，**启动过程不调用 npm**）。它优先以 `node apps/cli/lib/bin.js --profile web --port <port>` 派生启动 web profile **编译产物**（比 `tsx/esm` 跑源码冷启动快约 14 倍：1~2 秒 vs 22 秒）；若副本没有编译产物（如刚 clone 未构建），自动回退到 `node --import tsx/esm apps/cli/src/bin.ts`。
 - **单写入者保护**：`web` profile 启动时会在 `$DSH_HOME` 下建立单写入者锁 `dsh-web.lock`（记录持有进程 pid、端口与就绪 URL）。第二个 `dsh web`（或 `pnpm dsh web`）在锁持有者还存活时启动，会被**直接拒绝**并提示去打开已有服务，而不是再派生一个写进程——两个进程同时写同一个活跃会话正是日志序号错位（`seq gap in committed region`）的根源。持有者异常退出（崩溃/被强杀）后锁自动视为失效，下次启动自动接管；关窗/停服时锁随服务停止而释放。`DSH_GUI_FORCE_WEB=1` 可显式绕过（对应下方 `--parallel` / 显式 `--port`）。
 - **接管既有服务**：启动前先探测默认端口 3080 与锁文件。若已有 Harness 服务在运行（无论是否由本网关启动：锁文件、或 3080 端口应答），本窗口改为**直接接管连接**（用已有服务的地址开窗，关窗不停其服务）；锁文件中记录了存活持有者但端口无法连通时，网关拒绝再开第二个并给出提示。
 - 监听服务输出中的就绪行 `dsh web: http://127.0.0.1:PORT`，解析出实际地址。
@@ -45,10 +45,11 @@
 1. `pnpm install` —— 安装全部 workspace 依赖（之后运行时不再需要 npm）。
 2. 前端构建产物 `apps/web/dist` 已从原仓库复制过来；如需重新构建：`pnpm build:web`。
 3. 无需任何新配置：模型路由与密钥沿用本机 `$DSH_HOME`（`settings.yaml` + `.credentials.yaml`），会话与主仓库的 web GUI 完全互通。
+4. CLI 编译产物 `apps/cli/lib/*` 已随仓库提交（本网关的启动路径）。**改过 `apps/cli/src` 里的逻辑（如 `web-lock.ts`）后，必须重跑 `pnpm build:lib:host` 重建，否则桌面版仍跑旧产物**。
 
 ## 常见问题
 
-- **双击图标后一两分钟没反应**：首次启动服务需要 30–90 秒（加载全部插件）；日志见 `dsh-gui.log`。
+- **双击图标后几秒没反应**：新版走编译产物，通常 1~3 秒即就绪；若刚改过 `apps/cli/src` 而未重建、且恰好没有编译产物，会退回慢速 tsx 路径（较久）。日志见 `dsh-gui.log`。
 - **窗口里弹出脚本猫（ScriptCat）的引导页（docs.scriptcat.org）**：已修复。根因是 Edge 会把你在主浏览器里安装的扩展（含脚本猫）**同步进应用窗口的临时 profile**，脚本猫检测到该 profile 未开启“允许用户脚本”后每次启动都弹引导页。应用窗口现已加 `--disable-extensions --disable-sync` 等开关杜绝扩展与同步。窗口里剩余的 chrome-extension 页面是 Edge 内置组件（反馈、WebRTC 等），不会弹页面，与 Harness 无关。
 - **双击后无窗口、控制台提示 node not found**：安装 Node.js 22 或更新版本后重试。
 - **没有弹出窗口，但 `dsh-gui.log` 打印了 `ready at …`**：本机既没有 Edge 也没有 Chrome，网关已改用默认浏览器打开该 URL。

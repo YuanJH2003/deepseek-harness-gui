@@ -22,6 +22,19 @@ const invocation = parseDshArgs(process.argv.slice(2), readVersion());
 switch (invocation.mode) {
     case 'profile': {
         const { runProfile } = await import("./profile-boot.js");
+        // Single-writer guard for the web profile: two servers appending the same
+        // session store is what corrupts session logs (seq gaps). App `--help`
+        // boots nothing, so it bypasses the guard.
+        if (invocation.profile === 'web'
+            && !invocation.args.some(argument => argument === '--help' || argument === '-h')
+            && process.env.DSH_GUI_FORCE_WEB !== '1') {
+            const { guardWebServer, portFromArgs } = await import("./web-lock.js");
+            const guard = guardWebServer(portFromArgs(invocation.args));
+            if (guard.status === 'refused') {
+                console.log(guard.message);
+                process.exit(0);
+            }
+        }
         await runProfile({
             environment: loadLayeredEnv('dsh'),
             profile: invocation.profile,
