@@ -36,14 +36,21 @@ const REFUSED = Symbol('dsh-gui-refused')
 // refusing, and how often it re-checks.
 const RETRY_HOLDER_MS = 8000
 const RETRY_HOLDER_STEP_MS = 400
+/** Local clock stamp for audit-log lines (the log otherwise has no times). */
+const ts = () => new Date().toTimeString().slice(0, 8)
 
 // The single-writer lock mirrors apps/cli/src/web-lock.ts (replicated here so
 // this standalone launcher stays dependency-free). Two servers appending the
 // same session store is what corrupts session logs, so the gateway attaches to
 // a live holder instead of booting a second server.
 function webLockPath() {
+  // Must mirror @deepseek-ai/dsh-home-paths exactly: the harness home is
+  // $DSH_HOME when set and non-blank, otherwise ~/.dsh. (Using homedir()
+  // directly here made the gateway read a different lock file than the CLI
+  // does, so it never saw a live holder and its child got refused silently —
+  // the "first click does nothing" symptom.)
   const fromEnv = process.env.DSH_HOME
-  const home = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : homedir()
+  const home = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : join(homedir(), '.dsh')
   return join(home, 'dsh-web.lock')
 }
 
@@ -296,7 +303,7 @@ function spawnServer(port, forwarded, audit, force) {
     const lines = createInterface({ input: child.stdout })
     lines.on('line', (line) => {
       process.stdout.write(line + '\n')
-      audit.write(line + '\n')
+      audit.write(`[${ts()}] ${line}\n`)
       const match = URL_LINE.exec(line)
       if (match !== null) {
         const url = match[1]
@@ -307,7 +314,7 @@ function spawnServer(port, forwarded, audit, force) {
     })
     child.stderr.on('data', (chunk) => {
       process.stderr.write(chunk)
-      audit.write(chunk)
+      audit.write(`[${ts()}] ${String(chunk)}`)
     })
   })
   return { child, url: urlPromise }
@@ -352,8 +359,8 @@ function main() {
   const audit = createWriteStream(LOG_PATH, { flags: 'a' })
   const consoleLog = console.log
   const consoleError = console.error
-  console.log = (line) => { consoleLog(line); audit.write(line + '\n') }
-  console.error = (line) => { consoleError(line); audit.write(line + '\n') }
+  console.log = (line) => { consoleLog(line); audit.write(`[${ts()}] ${line}\n`) }
+  console.error = (line) => { consoleError(line); audit.write(`[${ts()}] ${line}\n`) }
 
   void (async () => {
     // Single-writer guard: a second process writing the same live session is
