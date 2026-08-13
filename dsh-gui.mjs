@@ -14,7 +14,7 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { createWriteStream, existsSync, rmSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
@@ -28,6 +28,57 @@ const DEFAULT_WEB_PORT = 3080
 // button (never grouped into Edge) whose icon comes from the desktop shortcut
 // carrying the same id — the DeepSeek whale — instead of the Edge logo.
 const APP_USER_MODEL_ID = 'DeepSeekHarnessGUI'
+// Sentinel: a live lock holder claims a server but it is unreachable; the
+// gateway must not start a second writer.
+const REFUSED = Symbol('dsh-gui-refused')
+
+// The single-writer lock mirrors apps/cli/src/web-lock.ts (replicated here so
+// this standalone launcher stays dependency-free). Two servers appending the
+// same session store is what corrupts session logs, so the gateway attaches to
+// a live holder instead of booting a second server.
+function webLockPath() {
+  const fromEnv = process.env.DSH_HOME
+  const home = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : homedir()
+  return join(home, 'dsh-web.lock')
+}
+
+function readWebLock() {
+  try {
+    const parsed = JSON.parse(readFileSync(webLockPath(), 'utf8'))
+    if (typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0) return parsed
+  } catch {
+    /* absent or unparsable: treated as no holder */
+  }
+  return undefined
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Record the announced URL on the lock held by a known server pid. */
+function setWebLockUrl(url, port, ownerPid) {
+  const record = readWebLock()
+  if (record === undefined || record.pid !== ownerPid) return
+  writeFileSync(webLockPath(), JSON.stringify({ ...record, port, url }), 'utf8')
+}
+
+/**
+ * Remove the lock file when it still belongs to a known server pid. The
+ * server releases its lock on clean exit; when it had to be force-killed
+ * (graceful shutdown stalled), the gateway clears the stale claim instead.
+ */
+function clearLockOf(ownerPid) {
+  const record = readWebLock()
+  if (record !== undefined && record.pid === ownerPid) {
+    try { rmSync(webLockPath(), { force: true }) } catch { /* best effort */ }
+  }
+}
 
 /** True when a DeepSeek Harness server is already answering on the given port. */
 async function probeHarnessOn(port) {
@@ -50,11 +101,27 @@ async function probeHarnessOn(port) {
 }
 
 /**
- * Return the URL of an already-running harness web server, or undefined.
- * A read-only probe: opens no session and writes nothing to the session store.
+ * Return the URL of an already-running harness web server, the REFUSED
+ * sentinel when a live lock holder is unreachable, or undefined. A read-only
+ * probe: opens no session and writes nothing to the session store.
  */
 async function detectRunningHarness() {
   if (await probeHarnessOn(DEFAULT_WEB_PORT)) return `http://127.0.0.1:${DEFAULT_WEB_PORT}`
+  const holder = readWebLock()
+  if (holder !== undefined && pidAlive(holder.pid)) {
+    const candidate = holder.url ?? (holder.port !== undefined && holder.port > 0
+      ? `http://127.0.0.1:${String(holder.port)}`
+      : undefined)
+    if (candidate !== undefined) {
+      const port = Number(new URL(candidate).port)
+      if (port > 0 && (await probeHarnessOn(port))) return candidate
+    }
+    // A live claim that cannot be reached: starting a second server would
+    // create the dual-writer hazard the lock exists to prevent.
+    console.error(`dsh gui: another server is claimed running (pid ${String(holder.pid)}) but unreachable`)
+    console.error('dsh gui: stop that process first, or force a second server with --parallel')
+    return REFUSED
+  }
   return undefined
 }
 
@@ -190,9 +257,10 @@ async function openAppWindow(url) {
 }
 
 /** Spawn the harness web server, tee its output, and wait for the readiness line. */
-function spawnServer(port, forwarded, audit) {
+function spawnServer(port, forwarded, audit, force) {
   const args = ['--import', 'tsx/esm', join(ROOT, 'apps/cli/src/bin.ts'), '--profile', 'web', '--port', port, ...forwarded]
-  const child = spawn(process.execPath, args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
+  const env = force === true ? { ...process.env, DSH_GUI_FORCE_WEB: '1' } : process.env
+  const child = spawn(process.execPath, args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env })
   writePid(child.pid)
   const urlPromise = new Promise((resolve) => {
     const lines = createInterface({ input: child.stdout })
@@ -200,7 +268,12 @@ function spawnServer(port, forwarded, audit) {
       process.stdout.write(line + '\n')
       audit.write(line + '\n')
       const match = URL_LINE.exec(line)
-      if (match !== null) resolve(match[1])
+      if (match !== null) {
+        const url = match[1]
+        const boundPort = Number(new URL(url).port)
+        if (Number.isInteger(boundPort) && boundPort > 0) setWebLockUrl(url, boundPort, child.pid)
+        resolve(url)
+      }
     })
     child.stderr.on('data', (chunk) => {
       process.stderr.write(chunk)
@@ -260,6 +333,9 @@ function main() {
     const existing = options.parallel || options.port !== '0'
       ? undefined
       : await detectRunningHarness()
+    if (existing === REFUSED) {
+      process.exit(1)
+    }
     if (existing !== undefined) {
       console.log(`dsh gui: another DeepSeek Harness server is already running at ${existing}`)
       console.log('dsh gui: attaching to it instead of starting a second server (keeps one writer per session)')
@@ -279,14 +355,25 @@ function main() {
 /** Boot an own harness server behind the gateway and manage its lifecycle. */
 function runOwnServer(options, audit) {
   console.log(`dsh gui: booting the DeepSeek Harness web profile${options.port === '0' ? ' on a free port' : ` on port ${options.port}`} …`)
-  const { child, url: serverUrl } = spawnServer(options.port, options.forward, audit)
+  // An explicit --port is an explicit request for an own server: bypass the
+  // single-writer lock the same way --parallel does.
+  const { child, url: serverUrl } = spawnServer(options.port, options.forward, audit, options.parallel || options.port !== '0')
   let stopping = false
+  let exitCode = 0
   const shutdown = (code) => {
     stopping = true
-    child.kill('SIGTERM')
-    setTimeout(() => child.kill('SIGKILL'), 3000).unref()
+    exitCode = code
     try { unlinkSync(PID_PATH) } catch { /* already gone */ }
-    process.exit(code)
+    // Never exit while the server child is alive: an orphan keeps the
+    // single-writer lock and keeps appending the session store. Give the
+    // graceful SIGTERM a moment, then hard-kill; the child's 'exit' below
+    // finally exits this gateway with `exitCode`.
+    const grace = setTimeout(() => {
+      child.kill('SIGKILL')
+      const lastResort = setTimeout(() => process.exit(exitCode), 2000)
+      lastResort.unref()
+    }, 4000)
+    grace.unref()
   }
   process.on('SIGINT', () => shutdown(130))
   process.on('SIGTERM', () => shutdown(143))
@@ -309,8 +396,16 @@ function runOwnServer(options, audit) {
     shutdown(1)
   })
   child.on('exit', (code) => {
+    // Belt-and-braces: if the server was force-killed, its own exit hook
+    // could not release the single-writer lock; clear the stale claim here.
+    clearLockOf(child.pid)
     if (stopping) {
       try { unlinkSync(PID_PATH) } catch { /* already gone */ }
+      process.exit(exitCode)
+    }
+    if (code === 0) {
+      // A clean early exit means the web-profile guard declined to start a
+      // second server; the refusal message is already on the console.
       process.exit(0)
     }
     console.error(`dsh gui: server exited unexpectedly (code ${code}); see ${LOG_PATH}`)

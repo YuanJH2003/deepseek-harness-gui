@@ -32,7 +32,8 @@
 
 - 桌面图标「DeepSeek Harness GUI」（`.lnk` → `wscript dsh-gui.vbs`）以**隐藏控制台**方式运行同一个网关：`dsh-gui.vbs` 先检查 node 是否存在，再静默启动；`dsh-gui.cmd --make-shortcut` 负责生成该图标。
 - `dsh-gui.mjs` 是一个 Node 脚本（唯一的运行时依赖是已安装的 Node.js，**启动过程不调用 npm**）。它以 `node --import tsx/esm apps/cli/src/bin.ts --profile web --port <port>` 派生启动 web profile 服务。
-- **单写入者保护**：启动前探测本机是否已有 Harness 服务在运行（默认探测 127.0.0.1:3080，只读、不写任何数据）；若存在，本窗口改为**直接接管连接**（用已有服务的地址开窗，关窗不停其服务），而不是再派生一个写进程——两个进程同时写同一个活跃会话会导致日志序号错位（`seq gap in committed region`）。`--parallel` 或显式 `--port` 可强制自起服务。
+- **单写入者保护**：`web` profile 启动时会在 `$DSH_HOME` 下建立单写入者锁 `dsh-web.lock`（记录持有进程 pid、端口与就绪 URL）。第二个 `dsh web`（或 `pnpm dsh web`）在锁持有者还存活时启动，会被**直接拒绝**并提示去打开已有服务，而不是再派生一个写进程——两个进程同时写同一个活跃会话正是日志序号错位（`seq gap in committed region`）的根源。持有者异常退出（崩溃/被强杀）后锁自动视为失效，下次启动自动接管；关窗/停服时锁随服务停止而释放。`DSH_GUI_FORCE_WEB=1` 可显式绕过（对应下方 `--parallel` / 显式 `--port`）。
+- **接管既有服务**：启动前先探测默认端口 3080 与锁文件。若已有 Harness 服务在运行（无论是否由本网关启动：锁文件、或 3080 端口应答），本窗口改为**直接接管连接**（用已有服务的地址开窗，关窗不停其服务）；锁文件中记录了存活持有者但端口无法连通时，网关拒绝再开第二个并给出提示。
 - 监听服务输出中的就绪行 `dsh web: http://127.0.0.1:PORT`，解析出实际地址。
 - 用 Edge（找不到时回退 Chrome）的 `--app=<url>` + **独立 `--user-data-dir`** 打开一个无标签页、无地址栏的应用窗口，并禁用扩展与账户同步（`--disable-extensions --disable-sync` 等），避免主浏览器的扩展（如脚本猫）被同步进来弹引导页；这个独立 Edge 实例的生命周期等同于窗口的生命周期，**窗口关闭 → 网关收到退出 → 停止服务 → 网关退出**。调试时可用环境变量 `DSH_GUI_DEBUG_PORT=<port>` 为该窗口开启远程调试端口。
 - **任务栏图标**：应用窗口以 Edge 启动但带专属应用身份（`--app-user-model-id=DeepSeekHarnessGUI`），在任务栏中作为**独立应用**显示（不会与浏览器 Edge 归为同一组）；同时网关会运行 `dsh-gui-taskbar-icon.ps1` 直接把窗口图标替换为**深色鲸鱼**（跨进程改窗口类图标，Edge 对 `--app` 窗口不采用快捷方式图标关联，所以用直接替换；失败时静默降级为 Edge 图标）。`dsh-gui.cmd --make-shortcut` 会为快捷方式打上同样的身份。普通 Edge 浏览窗口不受影响。若图标缓存未刷新，桌面图标可重启资源管理器或运行 `ie4uinit.exe -show` 恢复。
@@ -52,8 +53,8 @@
 - **双击后无窗口、控制台提示 node not found**：安装 Node.js 22 或更新版本后重试。
 - **没有弹出窗口，但 `dsh-gui.log` 打印了 `ready at …`**：本机既没有 Edge 也没有 Chrome，网关已改用默认浏览器打开该 URL。
 - **提示端口被占用**：换成 `dsh-gui --port <其它端口>`。
-- **历史加载失败 / 模型操作失败：corrupt session log: seq gap in committed region**：这是**同一个会话同时被两个 Harness 进程写入**导致的日志序号错位（例如桌面窗口与 `dsh web`（默认 3080 端口）同时打开同一个会话，两个进程各自维护序号向同一文件追加）。预防：**不要同时在两个窗口打开同一个会话**；网关现在会检测已有服务并改为“接管连接”，不再默认开第二个服务。若已损坏且无法打开：备份 `$DSH_HOME/sessions/<项目>/<会话id>/session.jsonl.zstd` 后联系维护者修复（或等该会话所在的服务停止、不再写入后，再做一次全量对齐修复）。
-- **应用窗口关掉后服务仍在**：用 `dsh-gui-stop.cmd` 清理。
+- **历史加载失败 / 模型操作失败：corrupt session log: seq gap in committed region**：这是**同一个会话同时被两个 Harness 进程写入**导致的日志序号错位（例如桌面窗口与 `dsh web`（默认 3080 端口）同时打开同一个会话，两个进程各自维护序号向同一文件追加）。预防：**不要同时在两个窗口打开同一个会话**；网关会检测已有服务并改为“接管连接”，不再默认开第二个服务；另外 `web` 启动自带**单写入者锁**（`$DSH_HOME/dsh-web.lock`），锁持有者存活时第二个服务端会被直接拒绝。若已损坏且无法打开：备份 `$DSH_HOME/sessions/<项目>/<会话id>/session.jsonl.zstd` 后联系维护者修复（或等该会话所在的服务停止、不再写入后，再做一次全量对齐修复）。
+- **应用窗口关掉后服务仍在**：网关现在会等待服务进程真正退出（超时则强杀兜底）再释放锁并退出，正常情况下不会残留；万一仍残留，用 `dsh-gui-stop.cmd` 清理（读取 `dsh-gui.pid` 停止对应服务）。
 - **界面空白 / 样式不对**：确认 `apps/web/dist/index.html` 存在（见“一次性准备”第 2 条）。
 
 ## 与主仓库的关系
