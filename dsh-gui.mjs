@@ -81,6 +81,22 @@ function setWebLockUrl(url, port, ownerPid) {
 }
 
 /**
+ * Drop the URL and port from a lock we own while keeping the holder claim.
+ * Called the moment our server starts shutting down: a launcher that arrives
+ * during the stop window must NOT attach to a server that is about to die (it
+ * would open a window pointed at a corpse - "history load failed"). It will
+ * wait out our child's exit and boot its own fresh server. The claim itself
+ * must survive until the child exits so a second server cannot boot while
+ * this one is still appending the session store.
+ */
+function stripWebLockUrl(ownerPid) {
+  const record = readWebLock()
+  if (record === undefined || record.pid !== ownerPid) return
+  const { url: _url, port: _port, ...claim } = record
+  writeFileSync(webLockPath(), JSON.stringify(claim), 'utf8')
+}
+
+/**
  * Remove the lock file when it still belongs to a known server pid. The
  * server releases its lock on clean exit; when it had to be force-killed
  * (graceful shutdown stalled), the gateway clears the stale claim instead.
@@ -401,6 +417,10 @@ function runOwnServer(options, audit) {
     stopping = true
     exitCode = code
     try { unlinkSync(PID_PATH) } catch { /* already gone */ }
+    // The server is about to die: stop advertising its URL so a launcher in
+    // this stop window waits out our exit and boots a fresh server instead of
+    // attaching to the dying one (which would show "history load failed").
+    stripWebLockUrl(child.pid)
     // Never exit while the server child is alive: an orphan keeps the
     // single-writer lock and keeps appending the session store. Give the
     // graceful SIGTERM a moment, then hard-kill; the child's 'exit' below
