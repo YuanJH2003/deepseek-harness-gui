@@ -60,6 +60,23 @@
 - **界面空白 / 样式不对**：确认 `apps/web/dist/index.html` 存在（见“一次性准备”第 2 条）。
 - **新打开的窗口“历史加载失败：Failed to fetch（internal）”**：常见于**关窗后立刻再点图标**。旧服务仍在收尾（最多 4 秒才释放单写者锁），新窗口若此时“附接”到它，服务一退出新窗口就断。现已在关窗瞬间**摘掉锁里的 URL 和端口**（保留持有者声明以挡住双写）：落在收尾期内的新启动会原地等待旧服务退出，然后自动启动一个**全新**服务，不再附接到将死的服务（等待期间无窗口、最多几秒）。
 
+## 已安装的社区插件
+
+已装 4 个插件（除 dsh-automation 外全部），均安装在 Web profile（`~/.dsh/profiles/web`，在用户目录、**不在本仓库**——换机器后用下方命令重装）。**装完重启应用窗口生效**（服务重启时组合前端；界面没变化就硬刷新 Ctrl+F5）。
+
+| 插件 | 安装命令 | 作用 |
+|---|---|---|
+| DSH-better-sidebar | `dsh plugin --profile web add git+https://github.com/omdsh-dev/DSH-better-sidebar.git` | VS Code 式侧边栏工作台：文件树、编辑器、真实终端、Git、Diff、后台任务页 |
+| dsh-genui | `dsh plugin --profile web add git+https://github.com/omdsh-dev/dsh-genui.git` | 回复内渲染交互组件（图表/表格/Mermaid/3D/表单），支持回连模型 |
+| dsh-at-file | `dsh plugin --profile web add https://github.com/omdsh-dev/dsh-at-file/archive/refs/heads/main.tar.gz` | 输入框 `@文件` 引用（Codex 风格，选中即注入文件内容，省一次工具调用） |
+| ModLens | `dsh plugin --profile web add @liustack/modlens@3.12.1` | 给纯文本模型补“读图”能力（host 端插件，模型选择器会出现 `… (modlens vision)` 条目） |
+
+注意：
+- 这里的 `dsh` 即本副本的 `apps/cli/lib/bin.js`（`dsh-gui` 内部就是跑它）；
+- pnpm ≥10 装 git 插件时会拦截构建脚本（node-pty 等原生模块），按 pnpm 提示把键加入 `~/.dsh/profiles/web/pnpm-workspace.yaml` 的 `allowBuilds` 即可；
+- ModLens 是高频发布的注册表包，被 pnpm 的 release-age 门禁拦到旧版时（旧版不声明 `dsh.bundle`、不会生效），显式钉版本号（即上面的 `@3.12.1`）；
+- ModLens 的视觉通道配置在 `~/.modlens/config.json`（零配置默认走免费的 antigravity-cli；也支持 Gemini/通义等，配置项含 `proxy`，可指向本机代理）。
+
 ## 与主仓库的关系
 
 - 上游：DeepSeek Harness 官方仓库（MIT 协议），只读参照，**未被修改**。
